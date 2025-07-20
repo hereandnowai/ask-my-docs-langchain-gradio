@@ -1,6 +1,5 @@
 import os
 import shutil
-import asyncio
 import gradio as gr
 import chromadb
 from dotenv import load_dotenv
@@ -29,26 +28,100 @@ os.makedirs(PDFS_DIR, exist_ok=True)
 os.makedirs(VECTOR_STORE_DIR, exist_ok=True)
 
 # --- STATE MANAGEMENT ---
-# This will hold the vector store instance in memory for the current session
 vector_store_instance = None
+
+# --- CORE LOGIC ---
+
+def rebuild_vector_store(files):
+    """Rebuilds the vector store from ALL PDFs in the PDFs directory."""
+    global vector_store_instance
+    if files:
+        for file in files:
+            shutil.copy(file.name, os.path.join(PDFS_DIR, os.path.basename(file.name)))
+
+    pdf_files = [f for f in os.listdir(PDFS_DIR) if f.endswith(".pdf")]
+    if not pdf_files:
+        return "Status: No PDF files found. Please upload at least one."
+
+    print("Rebuilding knowledge base...")
+    documents = []
+    for pdf_file in pdf_files:
+        try:
+            loader = PyPDFLoader(os.path.join(PDFS_DIR, pdf_file))
+            documents.extend(loader.load())
+        except Exception as e:
+            print(f"Error loading {pdf_file}: {e}")
+    
+    if not documents:
+        return "Status: Could not extract text from any PDFs."
+
+    texts = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_documents(documents)
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=API_KEY)
+    
+    client = chromadb.PersistentClient(path=VECTOR_STORE_DIR)
+    try:
+        client.delete_collection(name=COLLECTION_NAME)
+    except Exception as e:
+        print(f"Collection deletion failed (might not exist): {e}")
+
+    vector_store_instance = Chroma.from_documents(
+        documents=texts, embedding=embeddings, client=client,
+        collection_name=COLLECTION_NAME, persist_directory=VECTOR_STORE_DIR
+    )
+    return f"Status: Knowledge base created from {len(pdf_files)} PDF(s). Ready for questions."
+
+def get_answer(question):
+    """Handles the question asking logic."""
+    if not question:
+        return "Please enter a question.", ""
+    
+    qa_chain = get_qa_chain()
+    if qa_chain is None:
+        return "The knowledge base has not been created yet. Please process your PDFs first.", ""
+
+    try:
+        result = qa_chain.invoke({"query": question})
+        answer = result.get("result", "No answer found.")
+        sources = "\n".join(
+            [f"- {os.path.basename(doc.metadata.get('source', 'Unknown'))}, page {doc.metadata.get('page', 'N/A')}"
+             for doc in result.get("source_documents", [])]
+        )
+        return answer, sources
+    except Exception as e:
+        print(f"Error during Q&A: {e}")
+        return "An error occurred while generating the answer.", ""
+
+def clear_all_data():
+    """Clears the vector store collection and all PDFs."""
+    global vector_store_instance
+    vector_store_instance = None
+    
+    try:
+        client = chromadb.PersistentClient(path=VECTOR_STORE_DIR)
+        client.delete_collection(name=COLLECTION_NAME)
+    except Exception as e:
+        print(f"Could not clear collection (it might not exist): {e}")
+
+    if os.path.exists(PDFS_DIR):
+        shutil.rmtree(PDFS_DIR)
+    os.makedirs(PDFS_DIR)
+    
+    return "Status: All documents and knowledge base have been cleared."
+
+# --- LANGCHAIN SETUP ---
 
 def get_qa_chain():
     """Builds and returns a RetrievalQA chain using the vector store."""
     global vector_store_instance
     if vector_store_instance is None:
-        print("In-memory vector store not found. Attempting to load from disk.")
-        if not os.listdir(VECTOR_STORE_DIR):
-             print("Vector store directory is empty. Cannot load.")
-             return None
+        if not os.listdir(VECTOR_STORE_DIR): return None
         try:
             embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=API_KEY)
-            client = chromadb.PersistentClient(path=VECTOR_STORE_DIR)
             vector_store_instance = Chroma(
-                client=client,
+                client=chromadb.PersistentClient(path=VECTOR_STORE_DIR),
                 collection_name=COLLECTION_NAME,
                 embedding_function=embeddings,
             )
-            print("Vector store loaded from disk successfully.")
         except Exception as e:
             print(f"Failed to load vector store from disk: {e}")
             return None
@@ -71,13 +144,10 @@ def get_qa_chain():
     QA_PROMPT = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
 
     return RetrievalQA.from_chain_type(
-        llm,
-        retriever=retriever,
-        chain_type_kwargs={"prompt": QA_PROMPT},
-        return_source_documents=True,
+        llm, retriever=retriever, chain_type_kwargs={"prompt": QA_PROMPT}, return_source_documents=True
     )
 
-# --- GRADIO UI & EVENT HANDLERS ---
+# --- GRADIO UI SETUP ---
 
 def setup_gradio_ui():
     """Sets up and launches the Gradio web interface."""
@@ -103,104 +173,10 @@ def setup_gradio_ui():
                 gr.Markdown("### Sources")
                 sources_output = gr.Markdown("Source documents will be listed here...")
 
-        # --- Event Handlers ---
-        
-        async def process_pdfs_handler(files):
-            """
-            Rebuilds the vector store from ALL PDFs in the PDFs directory.
-            """
-            global vector_store_instance
-            if files:
-                for file in files:
-                    shutil.copy(file.name, os.path.join(PDFS_DIR, os.path.basename(file.name)))
-
-            pdf_files = [f for f in os.listdir(PDFS_DIR) if f.endswith(".pdf")]
-            if not pdf_files:
-                return "Status: No PDF files found. Please upload at least one."
-
-            print("Rebuilding knowledge base...")
-            
-            documents = []
-            for pdf_file in pdf_files:
-                file_path = os.path.join(PDFS_DIR, pdf_file)
-                try:
-                    loader = PyPDFLoader(file_path)
-                    documents.extend(loader.load())
-                except Exception as e:
-                    print(f"Error loading {pdf_file}: {e}")
-            
-            if not documents:
-                return "Status: Could not extract text from any PDFs."
-
-            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-            texts = text_splitter.split_documents(documents)
-            
-            embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=API_KEY)
-            
-            # Use the ChromaDB client to manage the collection
-            client = chromadb.PersistentClient(path=VECTOR_STORE_DIR)
-            try:
-                client.delete_collection(name=COLLECTION_NAME)
-                print(f"Deleted existing collection: {COLLECTION_NAME}")
-            except Exception as e:
-                print(f"Collection deletion failed (might not exist): {e}")
-
-            # Create the new vector store, which creates the collection
-            vector_store_instance = Chroma.from_documents(
-                documents=texts,
-                embedding=embeddings,
-                client=client,
-                collection_name=COLLECTION_NAME,
-                persist_directory=VECTOR_STORE_DIR,
-            )
-            
-            return f"Status: Knowledge base created from {len(pdf_files)} PDF(s). Ready for questions."
-
-        async def ask_question_handler(question):
-            """Handles the question asking button click."""
-            if not question:
-                return "Please enter a question.", ""
-            
-            qa_chain = get_qa_chain()
-            if qa_chain is None:
-                return "The knowledge base has not been created yet. Please process your PDFs first.", ""
-
-            try:
-                result = await asyncio.to_thread(qa_chain.invoke, {"query": question})
-                answer = result.get("result", "No answer found.")
-                sources = "\n".join(
-                    [f"- {os.path.basename(doc.metadata.get('source', 'Unknown'))}, page {doc.metadata.get('page', 'N/A')}"
-                     for doc in result.get("source_documents", [])]
-                )
-                return answer, sources
-            except Exception as e:
-                print(f"Error during Q&A: {e}")
-                return "An error occurred while generating the answer. Please check the console for details.", ""
-
-        def clear_all_data_handler():
-            """Clears the vector store collection and all PDFs."""
-            global vector_store_instance
-            vector_store_instance = None
-            
-            try:
-                client = chromadb.PersistentClient(path=VECTOR_STORE_DIR)
-                client.delete_collection(name=COLLECTION_NAME)
-                status = "Status: Knowledge base cleared."
-            except Exception as e:
-                print(f"Could not clear collection (it might not exist): {e}")
-                status = "Status: Knowledge base was already empty."
-
-            if os.path.exists(PDFS_DIR):
-                shutil.rmtree(PDFS_DIR)
-            os.makedirs(PDFS_DIR)
-            
-            print("All data has been cleared.")
-            return status
-
-        # Link handlers to Gradio components
-        process_button.click(process_pdfs_handler, inputs=[file_uploader], outputs=[processing_status])
-        ask_button.click(ask_question_handler, inputs=[question_input], outputs=[answer_output, sources_output])
-        clear_button.click(clear_all_data_handler, inputs=[], outputs=[processing_status])
+        # Link UI components to the core logic functions
+        process_button.click(rebuild_vector_store, inputs=[file_uploader], outputs=[processing_status])
+        ask_button.click(get_answer, inputs=[question_input], outputs=[answer_output, sources_output])
+        clear_button.click(clear_all_data, inputs=[], outputs=[processing_status])
 
     return app
 
