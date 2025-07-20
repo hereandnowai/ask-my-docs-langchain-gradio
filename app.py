@@ -27,7 +27,13 @@ COLLECTION_NAME = "ask_my_docs_collection"
 os.makedirs(PDFS_DIR, exist_ok=True)
 os.makedirs(VECTOR_STORE_DIR, exist_ok=True)
 
-# --- STATE MANAGEMENT ---
+# --- GLOBAL INSTANCES (Initialized once) ---
+try:
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=API_KEY)
+    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.7, google_api_key=API_KEY)
+except Exception as e:
+    raise RuntimeError(f"Failed to initialize Google AI models. Check your API key and network connection. Error: {e}")
+
 vector_store_instance = None
 
 # --- CORE LOGIC ---
@@ -56,7 +62,6 @@ def rebuild_vector_store(files):
         return "Status: Could not extract text from any PDFs."
 
     texts = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_documents(documents)
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=API_KEY)
     
     client = chromadb.PersistentClient(path=VECTOR_STORE_DIR)
     try:
@@ -116,7 +121,6 @@ def get_qa_chain():
     if vector_store_instance is None:
         if not os.listdir(VECTOR_STORE_DIR): return None
         try:
-            embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=API_KEY)
             vector_store_instance = Chroma(
                 client=chromadb.PersistentClient(path=VECTOR_STORE_DIR),
                 collection_name=COLLECTION_NAME,
@@ -126,7 +130,6 @@ def get_qa_chain():
             print(f"Failed to load vector store from disk: {e}")
             return None
 
-    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.7, google_api_key=API_KEY)
     retriever = vector_store_instance.as_retriever(search_kwargs={"k": 5})
     
     prompt_template = """
