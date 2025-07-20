@@ -1,0 +1,18 @@
+# Core LangChain and Gradio packages
+langchain
+gradio
+python-dotenv
+
+# LLM provider (Google Gemini)
+langchain-google-genai
+
+# Document Loaders
+pypdf
+
+# Vector Store and Embeddings
+chromadb
+langchain-community
+langchain-chroma
+
+# Optional: For FAISS vector store (alternative to Chroma)
+# faiss-cpu
